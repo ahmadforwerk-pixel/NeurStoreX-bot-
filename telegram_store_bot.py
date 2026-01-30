@@ -27,10 +27,11 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, PreCheckoutQueryHandler,
+    MessageHandler, PreCheckoutQueryHandler, ConversationHandler,
     filters, ContextTypes
 )
 from telegram.error import TelegramError
+import re
 
 # ============================================================================
 # إعدادات البوت
@@ -876,6 +877,13 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
             await update.message.reply_text("❌ حدث خطأ في التحقق من الدفع")
             return
         
+        # التحقق من حظر المستخدم
+        user_info = get_user_info(user_id)
+        if user_info and user_info['is_banned']:
+            log_security_event('fraud', user_id, 'محاولة شراء من حساب محظور', severity='high')
+            await update.message.reply_text("⛔ حسابك محظور ولا يمكنك الشراء")
+            return
+        
         payment_id = payment.telegram_payment_charge_id
         
         with db.get_connection() as conn:
@@ -892,6 +900,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
             
             if cursor.fetchone():
                 logger.warning(f"محاولة دفع مكرر: {payment_id}")
+                await update.message.reply_text("⚠️ تمت معالجة هذا الدفع مسبقاً")
                 return
             
             # الحصول على المنتج
@@ -1349,73 +1358,37 @@ async def admin_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_only
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """الإحصائيات التفصيلية"""
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إدارة المستخدمين"""
     query = update.callback_query
     await query.answer()
     
     with db.get_connection() as conn:
         cursor = conn.cursor()
-        
-        # المنتجات الأكثر مبيعاً
         cursor.execute("""
-            SELECT name, sold_count, price_stars
-            FROM products
-            WHERE sold_count > 0
-            ORDER BY sold_count DESC
-            LIMIT 5
-        """)
-        top_products = cursor.fetchall()
-        
-        # المبيعات اليومية
-        cursor.execute("""
-            SELECT COUNT(*) as count, COALESCE(SUM(price), 0) as total
-            FROM orders
-            WHERE status = 'completed' 
-            AND DATE(created_at) = DATE('now')
-        """)
-        today_sales = cursor.fetchone()
-        
-        # المبيعات الشهرية
-        cursor.execute("""
-            SELECT COUNT(*) as count, COALESCE(SUM(price), 0) as total
-            FROM orders
-            WHERE status = 'completed'
-            AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
-        """)
-        month_sales = cursor.fetchone()
-        
-        # المستخدمون الجدد اليوم
-        cursor.execute("""
-            SELECT COUNT(*) as count
+            SELECT user_id, first_name, username, total_purchases, balance, is_banned
             FROM users
-            WHERE DATE(join_date) = DATE('now')
+            ORDER BY join_date DESC
+            LIMIT 20
         """)
-        new_users_today = cursor.fetchone()['count']
+        users = cursor.fetchall()
     
-    text = f"""
-📊 *الإحصائيات التفصيلية*
-
-📅 *إحصائيات اليوم:*
-🧾 الطلبات: {today_sales['count']}
-💰 الإيرادات: {format_price(today_sales['total'])}
-👤 مستخدمين جدد: {new_users_today}
-
-📆 *إحصائيات الشهر:*
-🧾 الطلبات: {month_sales['count']}
-💰 الإيرادات: {format_price(month_sales['total'])}
-
-🏆 *المنتجات الأكثر مبيعاً:*
-"""
+    text = "👥 *إدارة المستخدمين*\n\n"
+    keyboard = []
     
-    for i, product in enumerate(top_products, 1):
-        text += f"{i}. {product['name']}\n"
-        text += f"   📊 {product['sold_count']} مبيعات | 💰 {format_price(product['price_stars'])}\n"
+    for user in users:
+        status = "🔒" if user['is_banned'] else "✅"
+        text += f"{status} {user['first_name']} (@{user['username'] or 'N/A'})\n"
+        text += f"🛍 المشتريات: {user['total_purchases']} | 💰 الرصيد: {format_price(user['balance'])}\n\n"
+        
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{status} {user['first_name'][:15]}...",
+                callback_data=f"admin_user_details_{user['user_id']}"
+            )
+        ])
     
-    keyboard = [
-        [InlineKeyboardButton("📥 تصدير التقرير", callback_data="admin_export_report")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]
-    ]
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")])
     
     await query.edit_message_text(
         text,
@@ -1423,15 +1396,1021 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
+@admin_only
+async def admin_user_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض تفاصيل المستخدم"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        user_id = int(query.data.split('_')[-1])
+        user_info = get_user_info(user_id)
+        
+        if not user_info:
+            await query.answer("المستخدم غير موجود", show_alert=True)
+            return
+        
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM users WHERE referred_by = ?
+            """, (user_id,))
+            referral_count = cursor.fetchone()['count']
+        
+        text = f"""
+👤 *تفاصيل المستخدم*
+
+🆔 المعرف: {user_id}
+👤 الاسم: {user_info['first_name']}
+📱 اليوزر: @{user_info['username'] or 'N/A'}
+
+💰 الرصيد: {format_price(user_info['balance'])}
+💳 إجمالي الإنفاق: {format_price(user_info['total_spent'])}
+🛍 عدد المشتريات: {user_info['total_purchases']}
+👥 الإحالات: {referral_count}
+
+🔒 الحالة: {'محظور ⛔' if user_info['is_banned'] else 'نشط ✅'}
+{'سبب الحظر: ' + (user_info['ban_reason'] or 'N/A') if user_info['is_banned'] else ''}
+
+📅 تاريخ الانضمام: {user_info['join_date'][:10]}
+"""
+        
+        keyboard = []
+        if user_info['is_banned']:
+            keyboard.append([InlineKeyboardButton("🔓 فك الحظر", callback_data=f"admin_unban_user_{user_id}")])
+        else:
+            keyboard.append([InlineKeyboardButton("🔒 حظر المستخدم", callback_data=f"admin_ban_user_{user_id}")])
+        
+        keyboard.extend([
+            [InlineKeyboardButton("💰 إضافة رصيد", callback_data=f"admin_add_balance_{user_id}")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="admin_users")]
+        ])
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"خطأ في عرض تفاصيل المستخدم: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
+
+@admin_only
+async def admin_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حظر المستخدم"""
+    query = update.callback_query
+    user_id = int(query.data.split('_')[-1])
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users SET is_banned = 1
+            WHERE user_id = ?
+        """, (user_id,))
+    
+    await query.answer("تم حظر المستخدم ✅")
+    await admin_user_details(update, context)
+
+@admin_only
+async def admin_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فك حظر المستخدم"""
+    query = update.callback_query
+    user_id = int(query.data.split('_')[-1])
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users SET is_banned = 0, ban_reason = NULL
+            WHERE user_id = ?
+        """, (user_id,))
+    
+    await query.answer("تم فك الحظر ✅")
+    await admin_user_details(update, context)
+
+@admin_only
+async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض جميع الطلبات"""
+    query = update.callback_query
+    await query.answer()
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT o.id, o.user_id, o.status, o.price, p.name, u.first_name
+            FROM orders o
+            JOIN products p ON o.product_id = p.id
+            JOIN users u ON o.user_id = u.user_id
+            ORDER BY o.created_at DESC
+            LIMIT 20
+        """)
+        orders = cursor.fetchall()
+    
+    if not orders:
+        text = "📭 لا توجد طلبات"
+        keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]]
+    else:
+        text = "🧾 *الطلبات:*\n\n"
+        keyboard = []
+        
+        for order in orders:
+            status_emoji = {
+                'pending': '⏳',
+                'completed': '✅',
+                'failed': '❌',
+                'refunded': '🔄'
+            }.get(order['status'], '❓')
+            
+            text += f"#{order['id']} {status_emoji} {order['name']}\n"
+            text += f"👤 {order['first_name']} | 💰 {format_price(order['price'])}\n\n"
+            
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"طلب #{order['id']}",
+                    callback_data=f"admin_order_details_{order['id']}"
+                )
+            ])
+        
+        keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")])
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+@admin_only
+async def admin_order_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تفاصيل الطلب"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        order_id = int(query.data.split('_')[-1])
+        
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT o.*, p.name, u.first_name, u.username
+                FROM orders o
+                JOIN products p ON o.product_id = p.id
+                JOIN users u ON o.user_id = u.user_id
+                WHERE o.id = ?
+            """, (order_id,))
+            order = cursor.fetchone()
+        
+        if not order:
+            await query.answer("الطلب غير موجود", show_alert=True)
+            return
+        
+        text = f"""
+🧾 *تفاصيل الطلب #{order_id}*
+
+👤 المستخدم: {order['first_name']} (@{order['username']})
+📦 المنتج: {order['name']}
+💰 المبلغ: {format_price(order['price'])}
+
+📊 الحالة: {order['status']}
+📮 حالة التوصيل: {order['delivery_status']}
+
+📅 تاريخ الطلب: {order['created_at']}
+"""
+        
+        if order['delivered_content']:
+            text += f"\n📝 المحتوى المسلّم:\n```\n{order['delivered_content'][:500]}\n```"
+        
+        keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="admin_orders")]]
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"خطأ في عرض تفاصيل الطلب: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
+
+@admin_only
+async def admin_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إدارة الفئات"""
+    query = update.callback_query
+    await query.answer()
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM categories
+            ORDER BY display_order, name
+        """)
+        categories = cursor.fetchall()
+    
+    text = "📁 *إدارة الفئات*\n\n"
+    keyboard = [[InlineKeyboardButton("➕ إضافة فئة جديدة", callback_data="admin_add_category")]]
+    
+    for cat in categories:
+        status = "✅" if cat['is_active'] else "❌"
+        text += f"{status} {cat['icon']} {cat['name']}\n"
+        text += f"📝 {cat['description'] or 'بدون وصف'}\n\n"
+        
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{cat['icon']} {cat['name'][:20]}...",
+                callback_data=f"admin_edit_category_{cat['id']}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")])
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+@admin_only
+async def admin_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إدارة الكوبونات"""
+    query = update.callback_query
+    await query.answer()
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM coupons
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+        coupons = cursor.fetchall()
+    
+    if not coupons:
+        text = "🎟 لا توجد كوبونات"
+        keyboard = [[InlineKeyboardButton("➕ إضافة كوبون", callback_data="admin_add_coupon")]]
+    else:
+        text = "🎟 *الكوبونات:*\n\n"
+        keyboard = [[InlineKeyboardButton("➕ إضافة كوبون", callback_data="admin_add_coupon")]]
+        
+        for coupon in coupons:
+            status = "✅" if coupon['is_active'] else "❌"
+            text += f"{status} {coupon['code']}\n"
+            text += f"💰 {coupon['discount_value']}{'%' if coupon['discount_type'] == 'percentage' else ' نجمة'} | الاستخدام: {coupon['used_count']}/{coupon['max_uses'] if coupon['max_uses'] > 0 else '∞'}\n\n"
+            
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{coupon['code']}",
+                    callback_data=f"admin_coupon_details_{coupon['id']}"
+                )
+            ])
+    
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")])
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+@admin_only
+async def admin_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إضافة منتج جديد"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['adding_product'] = {}
+    
+    text = """
+📦 *إضافة منتج جديد*
+
+الرجاء إرسال بيانات المنتج بالصيغة التالية:
+
+الاسم | الوصف | السعر (نجوم) | النوع (text/code/file/image/balance) | المحتوى
+
+مثال:
+كورس البرمجة | تعلم البرمجة من الصفر | 50 | text | محتوى الكورس هنا
+
+الأنواع المتاحة:
+- text: نص عادي
+- code: أكواد
+- file: ملف
+- image: صورة
+- balance: رصيد
+"""
+    
+    context.user_data['admin_adding_product'] = True
+    await query.edit_message_text(text)
+
+@admin_only
+async def admin_edit_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تعديل المنتج"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        product_id = int(query.data.split('_')[-1])
+        
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM products WHERE id = ?", (product_id,))
+            product = cursor.fetchone()
+        
+        if not product:
+            await query.answer("المنتج غير موجود", show_alert=True)
+            return
+        
+        text = f"""
+📦 *تعديل المنتج*
+
+📋 الاسم: {product['name']}
+💰 السعر: {format_price(product['price_stars'])}
+📝 الوصف: {product['description'] or 'بدون'}
+📊 المبيعات: {product['sold_count']}
+
+اختر ما تريد تعديله:
+"""
+        
+        keyboard = [
+            [InlineKeyboardButton("📝 تعديل الاسم", callback_data=f"admin_edit_product_name_{product_id}")],
+            [InlineKeyboardButton("💰 تعديل السعر", callback_data=f"admin_edit_product_price_{product_id}")],
+            [InlineKeyboardButton("📊 تعديل المخزون", callback_data=f"admin_edit_product_stock_{product_id}")],
+            [InlineKeyboardButton("🔄 تفعيل/تعطيل", callback_data=f"admin_toggle_product_{product_id}")],
+            [InlineKeyboardButton("🗑 حذف", callback_data=f"admin_delete_product_{product_id}")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="admin_products")]
+        ]
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"خطأ في تعديل المنتج: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
+
+@admin_only
+async def admin_toggle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تفعيل/تعطيل المنتج"""
+    query = update.callback_query
+    product_id = int(query.data.split('_')[-1])
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_active FROM products WHERE id = ?", (product_id,))
+        product = cursor.fetchone()
+        
+        new_status = 0 if product['is_active'] else 1
+        cursor.execute("""
+            UPDATE products SET is_active = ?
+            WHERE id = ?
+        """, (new_status, product_id))
+    
+    status = "مفعل ✅" if new_status else "معطل ❌"
+    await query.answer(f"تم تحديث حالة المنتج - {status}")
+    await admin_edit_product(update, context)
+
+@admin_only
+async def admin_delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف المنتج"""
+    query = update.callback_query
+    product_id = int(query.data.split('_')[-1])
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
+    
+    await query.answer("✅ تم حذف المنتج")
+    await admin_products(update, context)
+
+@admin_only
+async def admin_add_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إضافة فئة جديدة"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['admin_adding_category'] = True
+    
+    text = """
+📁 *إضافة فئة جديدة*
+
+الرجاء إرسال بيانات الفئة:
+
+الاسم | الوصف | الأيقونة
+
+مثال:
+الكورسات | كورسات تعليمية | 📚
+"""
+    
+    await query.edit_message_text(text)
+
+@admin_only
+async def admin_edit_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تعديل الفئة"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        category_id = int(query.data.split('_')[-1])
+        
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM categories WHERE id = ?", (category_id,))
+            category = cursor.fetchone()
+        
+        if not category:
+            await query.answer("الفئة غير موجودة", show_alert=True)
+            return
+        
+        text = f"""
+📁 *تعديل الفئة*
+
+{category['icon']} {category['name']}
+"""
+        
+        keyboard = [
+            [InlineKeyboardButton("📝 تعديل الاسم", callback_data=f"admin_edit_cat_name_{category_id}")],
+            [InlineKeyboardButton("🔄 تفعيل/تعطيل", callback_data=f"admin_toggle_cat_{category_id}")],
+            [InlineKeyboardButton("🗑 حذف", callback_data=f"admin_delete_cat_{category_id}")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="admin_categories")]
+        ]
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"خطأ في تعديل الفئة: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
+
+@admin_only
+async def admin_toggle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تفعيل/تعطيل الفئة"""
+    query = update.callback_query
+    category_id = int(query.data.split('_')[-1])
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_active FROM categories WHERE id = ?", (category_id,))
+        category = cursor.fetchone()
+        
+        new_status = 0 if category['is_active'] else 1
+        cursor.execute("""
+            UPDATE categories SET is_active = ?
+            WHERE id = ?
+        """, (new_status, category_id))
+    
+    await query.answer("✅ تم التحديث")
+    await admin_categories(update, context)
+
+@admin_only
+async def admin_delete_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف الفئة"""
+    query = update.callback_query
+    category_id = int(query.data.split('_')[-1])
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+    
+    await query.answer("✅ تم حذف الفئة")
+    await admin_categories(update, context)
+
+@admin_only
+async def admin_add_coupon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إضافة كوبون"""
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data['admin_adding_coupon'] = True
+    
+    text = """
+🎟 *إضافة كوبون جديد*
+
+الرجاء إرسال بيانات الكوبون:
+
+الكود | نوع الخصم (fixed/percentage) | القيمة | عدد الاستخدامات (-1 لغير محدود)
+
+مثال:
+SAVE50 | fixed | 50 | -1
+WELCOME20 | percentage | 20 | 100
+"""
+    
+    await query.edit_message_text(text)
+
+@admin_only
+async def admin_coupon_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تفاصيل الكوبون"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        coupon_id = int(query.data.split('_')[-1])
+        
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM coupons WHERE id = ?", (coupon_id,))
+            coupon = cursor.fetchone()
+        
+        if not coupon:
+            await query.answer("الكوبون غير موجود", show_alert=True)
+            return
+        
+        discount_text = f"{coupon['discount_value']}{'%' if coupon['discount_type'] == 'percentage' else ' نجمة'}"
+        
+        text = f"""
+🎟 *تفاصيل الكوبون*
+
+💾 الكود: {coupon['code']}
+💰 الخصم: {discount_text}
+🔢 الاستخدام: {coupon['used_count']}/{coupon['max_uses'] if coupon['max_uses'] > 0 else '∞'}
+{"✅ مفعل" if coupon['is_active'] else "❌ معطل"}
+"""
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 تفعيل/تعطيل", callback_data=f"admin_toggle_coupon_{coupon_id}")],
+            [InlineKeyboardButton("🗑 حذف", callback_data=f"admin_delete_coupon_{coupon_id}")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="admin_coupons")]
+        ]
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"خطأ في عرض تفاصيل الكوبون: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
+
+@admin_only
+async def admin_toggle_coupon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تفعيل/تعطيل الكوبون"""
+    query = update.callback_query
+    coupon_id = int(query.data.split('_')[-1])
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_active FROM coupons WHERE id = ?", (coupon_id,))
+        coupon = cursor.fetchone()
+        
+        new_status = 0 if coupon['is_active'] else 1
+        cursor.execute("""
+            UPDATE coupons SET is_active = ?
+            WHERE id = ?
+        """, (new_status, coupon_id))
+    
+    await query.answer("✅ تم التحديث")
+    await admin_coupon_details(update, context)
+
+@admin_only
+async def admin_delete_coupon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف الكوبون"""
+    query = update.callback_query
+    coupon_id = int(query.data.split('_')[-1])
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM coupons WHERE id = ?", (coupon_id,))
+    
+    await query.answer("✅ تم حذف الكوبون")
+    await admin_coupons(update, context)
+
+@admin_only
+async def admin_edit_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تعديل إعداد"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        setting_key = query.data.split('_', 3)[-1]
+        context.user_data['editing_setting'] = setting_key
+        
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM settings WHERE key = ?", (setting_key,))
+            result = cursor.fetchone()
+            current_value = result['value'] if result else 'N/A'
+        
+        text = f"✏️ *تعديل الإعداد*\n\n🔹 {setting_key}\nالقيمة الحالية: {current_value}\n\nالرجاء إرسال القيمة الجديدة:"
+        
+        await query.edit_message_text(text)
+    except Exception as e:
+        logger.error(f"خطأ في تعديل الإعداد: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
+
+
+
+@admin_only
+async def admin_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إدارة الإعدادات"""
+    query = update.callback_query
+    await query.answer()
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM settings")
+        settings = cursor.fetchall()
+    
+    text = "⚙️ *الإعدادات:*\n\n"
+    keyboard = []
+    
+    for setting in settings:
+        text += f"🔹 {setting['key']}: {setting['value']}\n"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"✏️ {setting['key']}",
+                callback_data=f"admin_edit_setting_{setting['key']}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")])
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+@admin_only
+async def admin_security_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """السجلات الأمنية"""
+    query = update.callback_query
+    await query.answer()
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM security_logs
+            ORDER BY timestamp DESC
+            LIMIT 20
+        """)
+        logs = cursor.fetchall()
+    
+    text = "🔒 *السجلات الأمنية:*\n\n"
+    keyboard = []
+    
+    for log in logs:
+        severity_emoji = {
+            'info': 'ℹ️',
+            'warning': '⚠️',
+            'high': '🔴',
+            'critical': '🚨'
+        }.get(log['severity'], '❓')
+        
+        text += f"{severity_emoji} {log['log_type']} - {log['action']}\n"
+        text += f"👤 المستخدم: {log['user_id'] or 'N/A'} | 📅 {log['timestamp'][:16]}\n\n"
+    
+    keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")])
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+@admin_only
+async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نسخة احتياطية من قاعدة البيانات"""
+    query = update.callback_query
+    
+    try:
+        backup_file = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        
+        import shutil
+        shutil.copy(DATABASE_FILE, backup_file)
+        
+        with open(backup_file, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=update.effective_user.id,
+                document=f,
+                filename=backup_file,
+                caption="💾 نسخة احتياطية من قاعدة البيانات"
+            )
+        
+        os.remove(backup_file)
+        await query.answer("✅ تم إرسال النسخة الاحتياطية")
+    except Exception as e:
+        logger.error(f"خطأ في النسخ الاحتياطي: {e}")
+        await query.answer("❌ حدث خطأ في النسخ الاحتياطي", show_alert=True)
+
+@rate_limit
+async def my_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض الإحالات"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT user_id, first_name, join_date, total_purchases
+            FROM users
+            WHERE referred_by = ?
+            ORDER BY join_date DESC
+        """, (user_id,))
+        referrals = cursor.fetchall()
+    
+    if not referrals:
+        text = "👥 ليس لديك إحالات حتى الآن\n\nشارك كود الإحالة الخاص بك مع أصدقائك!"
+        keyboard = [[InlineKeyboardButton("👤 حسابي", callback_data="my_account")]]
+    else:
+        text = f"👥 *إحالاتي ({len(referrals)}):*\n\n"
+        
+        total_earned = 0
+        for ref in referrals:
+            text += f"✅ {ref['first_name']}\n"
+            text += f"📅 {ref['join_date'][:10]} | 🛍 {ref['total_purchases']} مشتريات\n\n"
+            
+            with db.get_connection() as conn2:
+                cursor2 = conn2.cursor()
+                cursor2.execute("SELECT value FROM settings WHERE key = 'referral_reward'")
+                reward = int(cursor2.fetchone()[0])
+                total_earned += reward
+        
+        text += f"\n💰 إجمالي الأرباح: {format_price(total_earned)}"
+        keyboard = [[InlineKeyboardButton("👤 حسابي", callback_data="my_account")]]
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+@rate_limit
+async def order_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تفاصيل الطلب"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        order_id = int(query.data.split('_')[-1])
+        user_id = update.effective_user.id
+        
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT o.*, p.name, p.type
+                FROM orders o
+                JOIN products p ON o.product_id = p.id
+                WHERE o.id = ? AND o.user_id = ?
+            """, (order_id, user_id))
+            order = cursor.fetchone()
+        
+        if not order:
+            await query.answer("الطلب غير موجود", show_alert=True)
+            return
+        
+        status_text = {
+            'pending': '⏳ قيد المعالجة',
+            'completed': '✅ مكتمل',
+            'failed': '❌ فشل',
+            'refunded': '🔄 مسترجع'
+        }.get(order['status'], '❓')
+        
+        delivery_text = {
+            'pending': '📦 قيد التسليم',
+            'delivered': '✅ تم التسليم',
+            'failed': '❌ فشل التسليم'
+        }.get(order['delivery_status'], '❓')
+        
+        text = f"""
+🧾 *تفاصيل الطلب #{order_id}*
+
+📦 المنتج: {order['name']}
+💰 المبلغ: {format_price(order['price'])}
+
+📊 الحالة: {status_text}
+📮 التوصيل: {delivery_text}
+
+📅 التاريخ: {order['created_at'][:16]}
+"""
+        
+        if order['delivered_content'] and order['type'] == 'code':
+            text += f"\n🔑 الكود:\n```\n{order['delivered_content']}\n```"
+        elif order['delivered_content'] and order['type'] == 'text':
+            text += f"\n📝 المحتوى:\n```\n{order['delivered_content'][:300]}\n```"
+        elif order['delivered_content'] and order['type'] == 'balance':
+            text += f"\n💰 تمت إضافة {order['delivered_content']} نجمة"
+        
+        keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="my_orders")]]
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"خطأ في عرض تفاصيل الطلب: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
+
+
+
+async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """البث الفعلي للرسالة"""
+    if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    if not context.user_data.get('admin_broadcast_mode'):
+        return
+    
+    message_text = update.message.text
+    
+    if message_text.lower() == "إلغاء":
+        context.user_data['admin_broadcast_mode'] = False
+        await update.message.reply_text("✅ تم الإلغاء")
+        return
+    
+    # إرسال الرسالة للجميع
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT user_id FROM users WHERE is_banned = 0")
+        users = cursor.fetchall()
+    
+    success_count = 0
+    failed_count = 0
+    
+    for user in users:
+        try:
+            await context.bot.send_message(
+                chat_id=user['user_id'],
+                text=f"📢 *رسالة من الإدارة:*\n\n{message_text}",
+                parse_mode='Markdown'
+            )
+            success_count += 1
+        except:
+            failed_count += 1
+    
+    await update.message.reply_text(
+        f"✅ تم إرسال الرسالة\n\n📊 النتائج:\n✅ نجاح: {success_count}\n❌ فشل: {failed_count}"
+    )
+    context.user_data['admin_broadcast_mode'] = False
+
+async def save_setting_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حفظ قيمة الإعداد"""
+    if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    if not context.user_data.get('editing_setting'):
+        return
+    
+    setting_key = context.user_data['editing_setting']
+    setting_value = update.message.text
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE settings 
+            SET value = ?
+            WHERE key = ?
+        """, (setting_value, setting_key))
+    
+    await update.message.reply_text(f"✅ تم حفظ الإعداد: {setting_key}")
+    context.user_data['editing_setting'] = None
+    
+    # إعادة توجيه للإعدادات
+    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="admin_settings")]]
+    await update.message.reply_text(
+        "اختر الإجراء:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def handle_product_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة بيانات المنتج الجديد"""
+    if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    if not context.user_data.get('admin_adding_product'):
+        return
+    
+    message_text = update.message.text
+    
+    if message_text.lower() == "إلغاء":
+        context.user_data['admin_adding_product'] = False
+        await update.message.reply_text("✅ تم الإلغاء")
+        return
+    
+    try:
+        # تحليل البيانات
+        parts = [p.strip() for p in message_text.split('|')]
+        if len(parts) < 5:
+            await update.message.reply_text("❌ الرجاء إرسال جميع البيانات بالصيغة الصحيحة")
+            return
+        
+        name, description, price_str, product_type, content = parts[0], parts[1], parts[2], parts[3], parts[4]
+        
+        try:
+            price = int(price_str)
+        except ValueError:
+            await update.message.reply_text("❌ السعر يجب أن يكون رقماً")
+            return
+        
+        # إضافة المنتج
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO products (
+                    category_id, name, description, price_stars,
+                    type, content, is_active
+                ) VALUES (?, ?, ?, ?, ?, ?, 1)
+            """, (1, name, description, price, product_type, content))
+            
+            product_id = cursor.lastrowid
+        
+        await update.message.reply_text(
+            f"✅ تم إضافة المنتج!\n\n🆔 المعرف: {product_id}\n📝 الاسم: {name}\n💰 السعر: {price}"
+        )
+        context.user_data['admin_adding_product'] = False
+        
+    except Exception as e:
+        logger.error(f"خطأ في إضافة المنتج: {e}")
+        await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
+
+async def handle_category_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة بيانات الفئة الجديدة"""
+    if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    if not context.user_data.get('admin_adding_category'):
+        return
+    
+    message_text = update.message.text
+    
+    if message_text.lower() == "إلغاء":
+        context.user_data['admin_adding_category'] = False
+        await update.message.reply_text("✅ تم الإلغاء")
+        return
+    
+    try:
+        parts = [p.strip() for p in message_text.split('|')]
+        if len(parts) < 3:
+            await update.message.reply_text("❌ الرجاء إرسال جميع البيانات بالصيغة الصحيحة")
+            return
+        
+        name, description, icon = parts[0], parts[1], parts[2]
+        
+        # إضافة الفئة
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO categories (name, description, icon, is_active)
+                VALUES (?, ?, ?, 1)
+            """, (name, description, icon))
+            
+            category_id = cursor.lastrowid
+        
+        await update.message.reply_text(
+            f"✅ تم إضافة الفئة!\n\n🆔 المعرف: {category_id}\n📁 الاسم: {name}"
+        )
+        context.user_data['admin_adding_category'] = False
+        
+    except Exception as e:
+        logger.error(f"خطأ في إضافة الفئة: {e}")
+        await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
+
+async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة الرسائل النصية"""
+    user_id = update.effective_user.id
+    
+    # معالجة بث الرسائل (للمشرفين فقط)
+    if user_id in ADMIN_IDS and context.user_data.get('admin_broadcast_mode'):
+        await broadcast_message(update, context)
+        return
+    
+    # معالجة تعديل الإعدادات
+    if user_id in ADMIN_IDS and context.user_data.get('editing_setting'):
+        await save_setting_value(update, context)
+        return
+    
+    # معالجة إدخال بيانات المنتج الجديد
+    if user_id in ADMIN_IDS and context.user_data.get('admin_adding_product'):
+        await handle_product_data(update, context)
+        return
+    
+    # معالجة إدخال بيانات الفئة الجديدة
+    if user_id in ADMIN_IDS and context.user_data.get('admin_adding_category'):
+        await handle_category_data(update, context)
+        return
+    
+    # معالجة إدخال بيانات الكوبون الجديد
+    if user_id in ADMIN_IDS and context.user_data.get('admin_adding_coupon'):
+        await handle_coupon_data(update, context)
+        return
+    
+    # معالجة افتراضية
+    await update.message.reply_text(
+        "👋 مرحباً! استخدم الأزرار أدناه للتنقل.\n\n",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="main_menu")
+        ]])
+    )
+
 # ============================================================================
-# معالجات إضافية
+# معالجات Callback محسّنة مع إصلاحات
 # ============================================================================
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج أمر المساعدة"""
+async def out_of_stock_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج المنتجات المنتهية"""
     query = update.callback_query
-    if query:
-        await query.answer()
+    await query.answer("❌ هذا المنتج نفد المخزون", show_alert=True)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     with db.get_connection() as conn:
         cursor = conn.cursor()
@@ -1564,25 +2543,68 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     
-    # معالجات Callback
+    # معالجات Callback - الأساسية
     application.add_handler(CallbackQueryHandler(main_menu_handler, pattern="^main_menu$"))
     application.add_handler(CallbackQueryHandler(browse_products, pattern="^browse_products$"))
     application.add_handler(CallbackQueryHandler(show_category_products, pattern="^category_"))
     application.add_handler(CallbackQueryHandler(show_product_details, pattern="^product_"))
     application.add_handler(CallbackQueryHandler(initiate_purchase, pattern="^buy_"))
+    application.add_handler(CallbackQueryHandler(out_of_stock_handler, pattern="^out_of_stock$"))
+    
+    # معالجات الحساب والمشتريات
     application.add_handler(CallbackQueryHandler(my_account, pattern="^my_account$"))
     application.add_handler(CallbackQueryHandler(my_purchases, pattern="^my_purchases$"))
     application.add_handler(CallbackQueryHandler(my_orders, pattern="^my_orders$"))
+    application.add_handler(CallbackQueryHandler(my_referrals, pattern="^my_referrals$"))
+    application.add_handler(CallbackQueryHandler(order_details, pattern="^order_details_"))
     application.add_handler(CallbackQueryHandler(help_command, pattern="^help$"))
     
-    # لوحة الإدارة
+    # معالجات لوحة الإدارة - اللوحة الرئيسية
     application.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
+    
+    # معالجات لوحة الإدارة - المنتجات والفئات
     application.add_handler(CallbackQueryHandler(admin_products, pattern="^admin_products$"))
+    application.add_handler(CallbackQueryHandler(admin_add_product, pattern="^admin_add_product$"))
+    application.add_handler(CallbackQueryHandler(admin_edit_product, pattern="^admin_edit_product_"))
+    application.add_handler(CallbackQueryHandler(admin_toggle_product, pattern="^admin_toggle_product_"))
+    application.add_handler(CallbackQueryHandler(admin_delete_product, pattern="^admin_delete_product_"))
+    
+    application.add_handler(CallbackQueryHandler(admin_categories, pattern="^admin_categories$"))
+    application.add_handler(CallbackQueryHandler(admin_add_category, pattern="^admin_add_category$"))
+    application.add_handler(CallbackQueryHandler(admin_edit_category, pattern="^admin_edit_category_"))
+    application.add_handler(CallbackQueryHandler(admin_toggle_category, pattern="^admin_toggle_cat_"))
+    application.add_handler(CallbackQueryHandler(admin_delete_category, pattern="^admin_delete_cat_"))
+    
     application.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
+    
+    # معالجات لوحة الإدارة - المستخدمين
+    application.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users$"))
+    application.add_handler(CallbackQueryHandler(admin_user_details, pattern="^admin_user_details_"))
+    application.add_handler(CallbackQueryHandler(admin_ban_user, pattern="^admin_ban_user_"))
+    application.add_handler(CallbackQueryHandler(admin_unban_user, pattern="^admin_unban_user_"))
+    
+    # معالجات لوحة الإدارة - الطلبات والكوبونات
+    application.add_handler(CallbackQueryHandler(admin_orders, pattern="^admin_orders$"))
+    application.add_handler(CallbackQueryHandler(admin_order_details, pattern="^admin_order_details_"))
+    application.add_handler(CallbackQueryHandler(admin_coupons, pattern="^admin_coupons$"))
+    application.add_handler(CallbackQueryHandler(admin_add_coupon, pattern="^admin_add_coupon$"))
+    application.add_handler(CallbackQueryHandler(admin_coupon_details, pattern="^admin_coupon_details_"))
+    application.add_handler(CallbackQueryHandler(admin_toggle_coupon, pattern="^admin_toggle_coupon_"))
+    application.add_handler(CallbackQueryHandler(admin_delete_coupon, pattern="^admin_delete_coupon_"))
+    
+    # معالجات لوحة الإدارة - الإعدادات والآخر
+    application.add_handler(CallbackQueryHandler(admin_broadcast, pattern="^admin_broadcast$"))
+    application.add_handler(CallbackQueryHandler(admin_settings, pattern="^admin_settings$"))
+    application.add_handler(CallbackQueryHandler(admin_edit_setting, pattern="^admin_edit_setting_"))
+    application.add_handler(CallbackQueryHandler(admin_security_logs, pattern="^admin_security_logs$"))
+    application.add_handler(CallbackQueryHandler(admin_backup, pattern="^admin_backup$"))
     
     # معالجات الدفع
     application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    
+    # معالج الرسائل النصية (يجب أن يكون في النهاية)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
     
     # معالج الأخطاء
     application.add_error_handler(error_handler)
