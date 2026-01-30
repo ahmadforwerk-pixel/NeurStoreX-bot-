@@ -1669,6 +1669,84 @@ async def admin_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_only
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الإحصائيات التفصيلية"""
+    query = update.callback_query
+    await query.answer()
+    
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        
+        # المنتجات الأكثر مبيعاً
+        cursor.execute("""
+            SELECT name, sold_count, price_stars
+            FROM products
+            WHERE sold_count > 0
+            ORDER BY sold_count DESC
+            LIMIT 5
+        """)
+        top_products = cursor.fetchall()
+        
+        # المبيعات اليومية
+        cursor.execute("""
+            SELECT COUNT(*) as count, COALESCE(SUM(price), 0) as total
+            FROM orders
+            WHERE status = 'completed' 
+            AND DATE(created_at) = DATE('now')
+        """)
+        today_sales = cursor.fetchone()
+        
+        # المبيعات الشهرية
+        cursor.execute("""
+            SELECT COUNT(*) as count, COALESCE(SUM(price), 0) as total
+            FROM orders
+            WHERE status = 'completed'
+            AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+        """)
+        month_sales = cursor.fetchone()
+        
+        # المستخدمون الجدد اليوم
+        cursor.execute("""
+            SELECT COUNT(*) as count
+            FROM users
+            WHERE DATE(join_date) = DATE('now')
+        """)
+        new_users_today = cursor.fetchone()['count']
+    
+    text = f"""
+📊 *الإحصائيات التفصيلية*
+
+📅 *إحصائيات اليوم:*
+🧾 الطلبات: {today_sales['count']}
+💰 الإيرادات: {format_price(today_sales['total'])}
+👤 مستخدمين جدد: {new_users_today}
+
+📆 *إحصائيات الشهر:*
+🧾 الطلبات: {month_sales['count']}
+💰 الإيرادات: {format_price(month_sales['total'])}
+
+🏆 *المنتجات الأكثر مبيعاً:*
+"""
+    
+    if top_products:
+        for i, product in enumerate(top_products, 1):
+            text += f"{i}. {product['name']}\n"
+            text += f"   📊 {product['sold_count']} مبيعات | 💰 {format_price(product['price_stars'])}\n"
+    else:
+        text += "لا توجد مبيعات بعد"
+    
+    keyboard = [
+        [InlineKeyboardButton("📥 تصدير التقرير", callback_data="admin_export_report")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel")]
+    ]
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+@admin_only
 async def admin_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """إضافة منتج جديد"""
     query = update.callback_query
@@ -2362,6 +2440,57 @@ async def handle_category_data(update: Update, context: ContextTypes.DEFAULT_TYP
         
     except Exception as e:
         logger.error(f"خطأ في إضافة الفئة: {e}")
+        await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
+
+async def handle_coupon_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة بيانات الكوبون الجديد"""
+    if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    if not context.user_data.get('admin_adding_coupon'):
+        return
+    
+    message_text = update.message.text
+    
+    if message_text.lower() == "إلغاء":
+        context.user_data['admin_adding_coupon'] = False
+        await update.message.reply_text("✅ تم الإلغاء")
+        return
+    
+    try:
+        parts = [p.strip() for p in message_text.split('|')]
+        if len(parts) < 4:
+            await update.message.reply_text("❌ الرجاء إرسال جميع البيانات بالصيغة الصحيحة")
+            return
+        
+        code, discount_type, discount_value_str, max_uses_str = parts[0], parts[1], parts[2], parts[3]
+        
+        try:
+            discount_value = int(discount_value_str)
+            max_uses = int(max_uses_str)
+        except ValueError:
+            await update.message.reply_text("❌ القيم يجب أن تكون أرقام")
+            return
+        
+        # إضافة الكوبون
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO coupons (
+                    code, discount_type, discount_value, max_uses,
+                    is_active, created_by
+                ) VALUES (?, ?, ?, ?, 1, ?)
+            """, (code, discount_type, discount_value, max_uses, update.effective_user.id))
+            
+            coupon_id = cursor.lastrowid
+        
+        await update.message.reply_text(
+            f"✅ تم إضافة الكوبون!\n\n🆔 المعرف: {coupon_id}\n💾 الكود: {code}\n💰 الخصم: {discount_value}"
+        )
+        context.user_data['admin_adding_coupon'] = False
+        
+    except Exception as e:
+        logger.error(f"خطأ في إضافة الكوبون: {e}")
         await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
 
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
