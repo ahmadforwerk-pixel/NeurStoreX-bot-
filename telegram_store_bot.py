@@ -560,14 +560,22 @@ async def show_category_products(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     
-    category_id = int(query.data.split('_')[1])
+    try:
+        category_id = int(query.data.split('_')[1])
+    except (ValueError, IndexError):
+        await query.answer("❌ خطأ في الفئة", show_alert=True)
+        return
     
     with db.get_connection() as conn:
         cursor = conn.cursor()
         
         # الحصول على معلومات الفئة
-        cursor.execute("SELECT * FROM categories WHERE id = ?", (category_id,))
+        cursor.execute("SELECT * FROM categories WHERE id = ? AND is_active = 1", (category_id,))
         category = cursor.fetchone()
+        
+        if not category:
+            await query.answer("❌ الفئة غير موجودة", show_alert=True)
+            return
         
         # الحصول على المنتجات
         cursor.execute("""
@@ -577,7 +585,7 @@ async def show_category_products(update: Update, context: ContextTypes.DEFAULT_T
         """, (category_id,))
         products = cursor.fetchall()
     
-    if not products:
+    if not products or len(products) == 0:
         await query.edit_message_text(
             f"📭 لا توجد منتجات في فئة *{category['name']}* حالياً",
             reply_markup=InlineKeyboardMarkup([[
@@ -650,20 +658,25 @@ async def show_product_details(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     
-    product_id = int(query.data.split('_')[1])
+    try:
+        product_id = int(query.data.split('_')[1])
+    except (ValueError, IndexError):
+        await query.answer("❌ خطأ في المنتج", show_alert=True)
+        return
+    
     user_id = update.effective_user.id
     
     with db.get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT p.*, c.name as category_name
+            SELECT p.*, c.name as category_name, c.id as cat_id
             FROM products p
             LEFT JOIN categories c ON p.category_id = c.id
-            WHERE p.id = ?
+            WHERE p.id = ? AND p.is_active = 1
         """, (product_id,))
         product = cursor.fetchone()
     
-    if not product or not product['is_active']:
+    if not product:
         await query.edit_message_text(
             "❌ المنتج غير متاح",
             reply_markup=InlineKeyboardMarkup([[
@@ -728,8 +741,9 @@ async def show_product_details(update: Update, context: ContextTypes.DEFAULT_TYP
         ])
     
     # زر الرجوع
+    cat_id = product.get('cat_id') or product.get('category_id') or 1
     keyboard.append([
-        InlineKeyboardButton("🔙 رجوع", callback_data=f"category_{product['category_id']}")
+        InlineKeyboardButton("🔙 رجوع", callback_data=f"category_{cat_id}")
     ])
     
     await query.edit_message_text(
@@ -749,7 +763,12 @@ async def initiate_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    product_id = int(query.data.split('_')[1])
+    try:
+        product_id = int(query.data.split('_')[1])
+    except (ValueError, IndexError):
+        await query.answer("❌ خطأ في المنتج", show_alert=True)
+        return
+    
     user_id = update.effective_user.id
     
     # التحقق من حظر المستخدم
@@ -1459,7 +1478,13 @@ async def admin_user_details(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def admin_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """حظر المستخدم"""
     query = update.callback_query
-    user_id = int(query.data.split('_')[-1])
+    await query.answer()
+    
+    try:
+        user_id = int(query.data.split('_')[-1])
+    except (ValueError, IndexError):
+        await query.answer("❌ خطأ في المستخدم", show_alert=True)
+        return
     
     with db.get_connection() as conn:
         cursor = conn.cursor()
@@ -1475,7 +1500,13 @@ async def admin_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """فك حظر المستخدم"""
     query = update.callback_query
-    user_id = int(query.data.split('_')[-1])
+    await query.answer()
+    
+    try:
+        user_id = int(query.data.split('_')[-1])
+    except (ValueError, IndexError):
+        await query.answer("❌ خطأ في المستخدم", show_alert=True)
+        return
     
     with db.get_connection() as conn:
         cursor = conn.cursor()
@@ -1826,35 +1857,59 @@ async def admin_edit_product(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def admin_toggle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """تفعيل/تعطيل المنتج"""
     query = update.callback_query
-    product_id = int(query.data.split('_')[-1])
+    await query.answer()
     
-    with db.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT is_active FROM products WHERE id = ?", (product_id,))
-        product = cursor.fetchone()
+    try:
+        product_id = int(query.data.split('_')[-1])
+    except (ValueError, IndexError):
+        await query.answer("❌ خطأ في المنتج", show_alert=True)
+        return
+    
+    try:
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT is_active FROM products WHERE id = ?", (product_id,))
+            product = cursor.fetchone()
+            
+            if not product:
+                await query.answer("المنتج غير موجود", show_alert=True)
+                return
+            
+            new_status = 0 if product['is_active'] else 1
+            cursor.execute("""
+                UPDATE products SET is_active = ?
+                WHERE id = ?
+            """, (new_status, product_id))
         
-        new_status = 0 if product['is_active'] else 1
-        cursor.execute("""
-            UPDATE products SET is_active = ?
-            WHERE id = ?
-        """, (new_status, product_id))
-    
-    status = "مفعل ✅" if new_status else "معطل ❌"
-    await query.answer(f"تم تحديث حالة المنتج - {status}")
-    await admin_edit_product(update, context)
+        status = "مفعل ✅" if new_status else "معطل ❌"
+        await query.answer(f"تم تحديث حالة المنتج - {status}")
+        await admin_edit_product(update, context)
+    except Exception as e:
+        logger.error(f"خطأ في تحديث المنتج: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
 
 @admin_only
 async def admin_delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """حذف المنتج"""
     query = update.callback_query
-    product_id = int(query.data.split('_')[-1])
+    await query.answer()
     
-    with db.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
+    try:
+        product_id = int(query.data.split('_')[-1])
+    except (ValueError, IndexError):
+        await query.answer("❌ خطأ في المنتج", show_alert=True)
+        return
     
-    await query.answer("✅ تم حذف المنتج")
-    await admin_products(update, context)
+    try:
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
+        
+        await query.answer("✅ تم حذف المنتج")
+        await admin_products(update, context)
+    except Exception as e:
+        logger.error(f"خطأ في حذف المنتج: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
 
 @admin_only
 async def admin_add_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1921,21 +1976,35 @@ async def admin_edit_category(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_toggle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """تفعيل/تعطيل الفئة"""
     query = update.callback_query
-    category_id = int(query.data.split('_')[-1])
+    await query.answer()
     
-    with db.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT is_active FROM categories WHERE id = ?", (category_id,))
-        category = cursor.fetchone()
+    try:
+        category_id = int(query.data.split('_')[-1])
+    except (ValueError, IndexError):
+        await query.answer("❌ خطأ في الفئة", show_alert=True)
+        return
+    
+    try:
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT is_active FROM categories WHERE id = ?", (category_id,))
+            category = cursor.fetchone()
+            
+            if not category:
+                await query.answer("الفئة غير موجودة", show_alert=True)
+                return
+            
+            new_status = 0 if category['is_active'] else 1
+            cursor.execute("""
+                UPDATE categories SET is_active = ?
+                WHERE id = ?
+            """, (new_status, category_id))
         
-        new_status = 0 if category['is_active'] else 1
-        cursor.execute("""
-            UPDATE categories SET is_active = ?
-            WHERE id = ?
-        """, (new_status, category_id))
-    
-    await query.answer("✅ تم التحديث")
-    await admin_categories(update, context)
+        await query.answer("✅ تم التحديث")
+        await admin_categories(update, context)
+    except Exception as e:
+        logger.error(f"خطأ في تحديث الفئة: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
 
 @admin_only
 async def admin_delete_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2020,34 +2089,58 @@ async def admin_coupon_details(update: Update, context: ContextTypes.DEFAULT_TYP
 async def admin_toggle_coupon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """تفعيل/تعطيل الكوبون"""
     query = update.callback_query
-    coupon_id = int(query.data.split('_')[-1])
+    await query.answer()
     
-    with db.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT is_active FROM coupons WHERE id = ?", (coupon_id,))
-        coupon = cursor.fetchone()
+    try:
+        coupon_id = int(query.data.split('_')[-1])
+    except (ValueError, IndexError):
+        await query.answer("❌ خطأ في الكوبون", show_alert=True)
+        return
+    
+    try:
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT is_active FROM coupons WHERE id = ?", (coupon_id,))
+            coupon = cursor.fetchone()
+            
+            if not coupon:
+                await query.answer("الكوبون غير موجود", show_alert=True)
+                return
+            
+            new_status = 0 if coupon['is_active'] else 1
+            cursor.execute("""
+                UPDATE coupons SET is_active = ?
+                WHERE id = ?
+            """, (new_status, coupon_id))
         
-        new_status = 0 if coupon['is_active'] else 1
-        cursor.execute("""
-            UPDATE coupons SET is_active = ?
-            WHERE id = ?
-        """, (new_status, coupon_id))
-    
-    await query.answer("✅ تم التحديث")
-    await admin_coupon_details(update, context)
+        await query.answer("✅ تم التحديث")
+        await admin_coupon_details(update, context)
+    except Exception as e:
+        logger.error(f"خطأ في تحديث الكوبون: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
 
 @admin_only
 async def admin_delete_coupon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """حذف الكوبون"""
     query = update.callback_query
-    coupon_id = int(query.data.split('_')[-1])
+    await query.answer()
     
-    with db.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM coupons WHERE id = ?", (coupon_id,))
+    try:
+        coupon_id = int(query.data.split('_')[-1])
+    except (ValueError, IndexError):
+        await query.answer("❌ خطأ في الكوبون", show_alert=True)
+        return
     
-    await query.answer("✅ تم حذف الكوبون")
-    await admin_coupons(update, context)
+    try:
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM coupons WHERE id = ?", (coupon_id,))
+        
+        await query.answer("✅ تم حذف الكوبون")
+        await admin_coupons(update, context)
+    except Exception as e:
+        logger.error(f"خطأ في حذف الكوبون: {e}")
+        await query.answer("حدث خطأ", show_alert=True)
 
 @admin_only
 async def admin_edit_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2073,6 +2166,23 @@ async def admin_edit_setting(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("حدث خطأ", show_alert=True)
 
 
+
+@admin_only
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إرسال رسالة للجميع"""
+    query = update.callback_query
+    await query.answer()
+    
+    text = """
+📢 *إرسال رسالة للجميع*
+
+أرسل الرسالة التي تريد بثها:
+(اكتب 'إلغاء' للإلغاء)
+"""
+    
+    context.user_data['admin_broadcast_mode'] = True
+    
+    await query.edit_message_text(text, parse_mode='Markdown')
 
 @admin_only
 async def admin_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2665,82 +2775,87 @@ def main():
     """تشغيل البوت"""
     logger.info("بدء تشغيل البوت...")
     
-    # إنشاء التطبيق
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # معالجات الأوامر
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    
-    # معالجات Callback - الأساسية
-    application.add_handler(CallbackQueryHandler(main_menu_handler, pattern="^main_menu$"))
-    application.add_handler(CallbackQueryHandler(browse_products, pattern="^browse_products$"))
-    application.add_handler(CallbackQueryHandler(show_category_products, pattern="^category_"))
-    application.add_handler(CallbackQueryHandler(show_product_details, pattern="^product_"))
-    application.add_handler(CallbackQueryHandler(initiate_purchase, pattern="^buy_"))
-    application.add_handler(CallbackQueryHandler(out_of_stock_handler, pattern="^out_of_stock$"))
-    
-    # معالجات الحساب والمشتريات
-    application.add_handler(CallbackQueryHandler(my_account, pattern="^my_account$"))
-    application.add_handler(CallbackQueryHandler(my_purchases, pattern="^my_purchases$"))
-    application.add_handler(CallbackQueryHandler(my_orders, pattern="^my_orders$"))
-    application.add_handler(CallbackQueryHandler(my_referrals, pattern="^my_referrals$"))
-    application.add_handler(CallbackQueryHandler(order_details, pattern="^order_details_"))
-    application.add_handler(CallbackQueryHandler(help_command, pattern="^help$"))
-    
-    # معالجات لوحة الإدارة - اللوحة الرئيسية
-    application.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
-    
-    # معالجات لوحة الإدارة - المنتجات والفئات
-    application.add_handler(CallbackQueryHandler(admin_products, pattern="^admin_products$"))
-    application.add_handler(CallbackQueryHandler(admin_add_product, pattern="^admin_add_product$"))
-    application.add_handler(CallbackQueryHandler(admin_edit_product, pattern="^admin_edit_product_"))
-    application.add_handler(CallbackQueryHandler(admin_toggle_product, pattern="^admin_toggle_product_"))
-    application.add_handler(CallbackQueryHandler(admin_delete_product, pattern="^admin_delete_product_"))
-    
-    application.add_handler(CallbackQueryHandler(admin_categories, pattern="^admin_categories$"))
-    application.add_handler(CallbackQueryHandler(admin_add_category, pattern="^admin_add_category$"))
-    application.add_handler(CallbackQueryHandler(admin_edit_category, pattern="^admin_edit_category_"))
-    application.add_handler(CallbackQueryHandler(admin_toggle_category, pattern="^admin_toggle_cat_"))
-    application.add_handler(CallbackQueryHandler(admin_delete_category, pattern="^admin_delete_cat_"))
-    
-    application.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
-    
-    # معالجات لوحة الإدارة - المستخدمين
-    application.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users$"))
-    application.add_handler(CallbackQueryHandler(admin_user_details, pattern="^admin_user_details_"))
-    application.add_handler(CallbackQueryHandler(admin_ban_user, pattern="^admin_ban_user_"))
-    application.add_handler(CallbackQueryHandler(admin_unban_user, pattern="^admin_unban_user_"))
-    
-    # معالجات لوحة الإدارة - الطلبات والكوبونات
-    application.add_handler(CallbackQueryHandler(admin_orders, pattern="^admin_orders$"))
-    application.add_handler(CallbackQueryHandler(admin_order_details, pattern="^admin_order_details_"))
-    application.add_handler(CallbackQueryHandler(admin_coupons, pattern="^admin_coupons$"))
-    application.add_handler(CallbackQueryHandler(admin_add_coupon, pattern="^admin_add_coupon$"))
-    application.add_handler(CallbackQueryHandler(admin_coupon_details, pattern="^admin_coupon_details_"))
-    application.add_handler(CallbackQueryHandler(admin_toggle_coupon, pattern="^admin_toggle_coupon_"))
-    application.add_handler(CallbackQueryHandler(admin_delete_coupon, pattern="^admin_delete_coupon_"))
-    
-    # معالجات لوحة الإدارة - الإعدادات والآخر
-    application.add_handler(CallbackQueryHandler(admin_broadcast, pattern="^admin_broadcast$"))
-    application.add_handler(CallbackQueryHandler(admin_settings, pattern="^admin_settings$"))
-    application.add_handler(CallbackQueryHandler(admin_edit_setting, pattern="^admin_edit_setting_"))
-    application.add_handler(CallbackQueryHandler(admin_security_logs, pattern="^admin_security_logs$"))
-    application.add_handler(CallbackQueryHandler(admin_backup, pattern="^admin_backup$"))
-    
-    # معالجات الدفع
-    application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
-    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-    
-    # معالج الرسائل النصية (يجب أن يكون في النهاية)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
-    
-    # معالج الأخطاء
-    application.add_error_handler(error_handler)
-    
-    # تشغيل البوت
-    logger.info("✅ البوت يعمل الآن!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        # إنشاء التطبيق
+        application = Application.builder().token(BOT_TOKEN).build()
+        
+        # معالجات الأوامر
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("help", help_command))
+        
+        # معالجات Callback - الأساسية
+        application.add_handler(CallbackQueryHandler(main_menu_handler, pattern="^main_menu$"))
+        application.add_handler(CallbackQueryHandler(browse_products, pattern="^browse_products$"))
+        application.add_handler(CallbackQueryHandler(show_category_products, pattern="^category_"))
+        application.add_handler(CallbackQueryHandler(show_product_details, pattern="^product_"))
+        application.add_handler(CallbackQueryHandler(initiate_purchase, pattern="^buy_"))
+        application.add_handler(CallbackQueryHandler(out_of_stock_handler, pattern="^out_of_stock$"))
+        
+        # معالجات الحساب والمشتريات
+        application.add_handler(CallbackQueryHandler(my_account, pattern="^my_account$"))
+        application.add_handler(CallbackQueryHandler(my_purchases, pattern="^my_purchases$"))
+        application.add_handler(CallbackQueryHandler(my_orders, pattern="^my_orders$"))
+        application.add_handler(CallbackQueryHandler(my_referrals, pattern="^my_referrals$"))
+        application.add_handler(CallbackQueryHandler(order_details, pattern="^order_details_"))
+        application.add_handler(CallbackQueryHandler(help_command, pattern="^help$"))
+        
+        # معالجات لوحة الإدارة - اللوحة الرئيسية
+        application.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
+        
+        # معالجات لوحة الإدارة - المنتجات والفئات
+        application.add_handler(CallbackQueryHandler(admin_products, pattern="^admin_products$"))
+        application.add_handler(CallbackQueryHandler(admin_add_product, pattern="^admin_add_product$"))
+        application.add_handler(CallbackQueryHandler(admin_edit_product, pattern="^admin_edit_product_"))
+        application.add_handler(CallbackQueryHandler(admin_toggle_product, pattern="^admin_toggle_product_"))
+        application.add_handler(CallbackQueryHandler(admin_delete_product, pattern="^admin_delete_product_"))
+        
+        application.add_handler(CallbackQueryHandler(admin_categories, pattern="^admin_categories$"))
+        application.add_handler(CallbackQueryHandler(admin_add_category, pattern="^admin_add_category$"))
+        application.add_handler(CallbackQueryHandler(admin_edit_category, pattern="^admin_edit_category_"))
+        application.add_handler(CallbackQueryHandler(admin_toggle_category, pattern="^admin_toggle_cat_"))
+        application.add_handler(CallbackQueryHandler(admin_delete_category, pattern="^admin_delete_cat_"))
+        
+        application.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
+        
+        # معالجات لوحة الإدارة - المستخدمين
+        application.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users$"))
+        application.add_handler(CallbackQueryHandler(admin_user_details, pattern="^admin_user_details_"))
+        application.add_handler(CallbackQueryHandler(admin_ban_user, pattern="^admin_ban_user_"))
+        application.add_handler(CallbackQueryHandler(admin_unban_user, pattern="^admin_unban_user_"))
+        
+        # معالجات لوحة الإدارة - الطلبات والكوبونات
+        application.add_handler(CallbackQueryHandler(admin_orders, pattern="^admin_orders$"))
+        application.add_handler(CallbackQueryHandler(admin_order_details, pattern="^admin_order_details_"))
+        application.add_handler(CallbackQueryHandler(admin_coupons, pattern="^admin_coupons$"))
+        application.add_handler(CallbackQueryHandler(admin_add_coupon, pattern="^admin_add_coupon$"))
+        application.add_handler(CallbackQueryHandler(admin_coupon_details, pattern="^admin_coupon_details_"))
+        application.add_handler(CallbackQueryHandler(admin_toggle_coupon, pattern="^admin_toggle_coupon_"))
+        application.add_handler(CallbackQueryHandler(admin_delete_coupon, pattern="^admin_delete_coupon_"))
+        
+        # معالجات لوحة الإدارة - الإعدادات والآخر
+        application.add_handler(CallbackQueryHandler(admin_broadcast, pattern="^admin_broadcast$"))
+        application.add_handler(CallbackQueryHandler(admin_settings, pattern="^admin_settings$"))
+        application.add_handler(CallbackQueryHandler(admin_edit_setting, pattern="^admin_edit_setting_"))
+        application.add_handler(CallbackQueryHandler(admin_security_logs, pattern="^admin_security_logs$"))
+        application.add_handler(CallbackQueryHandler(admin_backup, pattern="^admin_backup$"))
+        
+        # معالجات الدفع
+        application.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+        application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+        
+        # معالج الرسائل النصية (يجب أن يكون في النهاية)
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
+        
+        # معالج الأخطاء
+        application.add_error_handler(error_handler)
+        
+        # تشغيل البوت
+        logger.info("✅ البوت يعمل الآن!")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        logger.error(f"❌ خطأ عند بدء البوت: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
